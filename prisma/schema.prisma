@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TransactionType {
+  ONLINE_SHOPPING
+  LAND
+  REAL_ESTATE
+}
+
+enum TransactionStatus {
+  AWAITING_ACCEPTANCE
+  AWAITING_FUNDING
+  FUNDED
+  IN_PROGRESS
+  INSPECTION
+  COMPLETED
+  DISPUTED
+  REFUNDED
+  CLOSED
+}
+
+enum TransactionFundingParty {
+  ME
+  COUNTERPARTY
+}
+
+enum TransactionWorkflow {
+  PUBLIC_SHAREABLE
+  ESCROW_TWO_PARTY
+}
+
+enum ParticipantInviteStatus {
+  NONE
+  PENDING
+  ACCEPTED
+}
+
+model Transaction {
+  id          String             @id @default(uuid())
+  workflow    TransactionWorkflow @default(ESCROW_TWO_PARTY)
+  shareToken  String?            @unique
+  /// Set when a buyer claims a shareable template (new orders only).
+  sourceShareTransactionId String?
+  sourceShareTransaction   Transaction?  @relation("ShareBuyerOrders", fields: [sourceShareTransactionId], references: [id], onDelete: SetNull)
+  shareBuyerCopies         Transaction[] @relation("ShareBuyerOrders")
+  type        TransactionType
+  productId   String?
+  productTitle String
+  quantity    Int                @default(1)
+  unitPrice   Decimal?           @db.Decimal(18, 2)
+  amount      Decimal            @db.Decimal(18, 2)
+  buyerId     String?
+  sellerId    String
+  createdByUserId String
+  fundedBy    TransactionFundingParty
+  terms       String
+  status      TransactionStatus  @default(AWAITING_ACCEPTANCE)
+  acceptedPartyIds String[]    @default([])
+  buyerLawyerId    String?
+  buyerLawyerInviteStatus ParticipantInviteStatus @default(NONE)
+  buyerAgentId     String?
+  buyerAgentInviteStatus ParticipantInviteStatus @default(NONE)
+  sellerLawyerId   String?
+  sellerLawyerInviteStatus ParticipantInviteStatus @default(NONE)
+  sellerAgentId    String?
+  sellerAgentInviteStatus ParticipantInviteStatus @default(NONE)
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+  documents   TransactionDocument[]
+  agreements  AgreementVersion[]
+  auditLogs   TransactionAudit[]
+  notifications TransactionNotification[]
+  publicViews TransactionPublicView[]
+}
+
+model TransactionPublicView {
+  id            String      @id @default(uuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  deviceId      String?
+  viewerUserId  String?
+  userAgent     String?
+  convertedAt   DateTime?
+  createdAt     DateTime    @default(now())
+
+  @@index([transactionId, createdAt])
+  @@index([transactionId, deviceId])
+  @@index([transactionId, viewerUserId])
+}
+
+model TransactionDocument {
+  id            String      @id @default(uuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  fileUrl       String
+  fileKey       String
+  uploader      String
+  createdAt     DateTime    @default(now())
+}
+
+model AgreementVersion {
+  id            String      @id @default(uuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  version       Int
+  content       String
+  actorId       String
+  createdAt     DateTime    @default(now())
+  @@unique([transactionId, version])
+}
+
+model TransactionAudit {
+  id            String      @id @default(uuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  action        String
+  actorId       String
+  detail        String
+  createdAt     DateTime    @default(now())
+}
+
+model TransactionNotification {
+  id            String      @id @default(uuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  recipientId   String
+  message       String
+  role          String
+  readAt        DateTime?
+  createdAt     DateTime    @default(now())
+
+  @@index([recipientId, createdAt(sort: Desc)])
+}
