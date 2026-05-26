@@ -295,28 +295,25 @@ export class TransactionsService {
   }
 
   private async searchUserDirectory(query: string) {
-    const q = encodeURIComponent(query.trim());
-    const res = await fetch(`${this.userServiceUrl()}/users/search?query=${q}`);
-    if (res.status === 404) {
+    try {
+      return await this.rabbit.rpc<Record<string, unknown>>('user.rpc.user.search', {
+        query: query.trim(),
+      });
+    } catch {
       return null;
     }
-    if (!res.ok) {
-      throw new ServiceUnavailableException('counterparty lookup is currently unavailable');
-    }
-    return (await res.json()) as Record<string, unknown>;
   }
 
   private async searchApprovedProfessionals(role: ParticipantRole, query: string) {
-    const q = new URLSearchParams({
-      role,
-      query: query.trim(),
-    }).toString();
-    const res = await fetch(`${this.userServiceUrl()}/users/professionals/search?${q}`);
-    if (!res.ok) {
+    try {
+      const body = await this.rabbit.rpc<{ items?: Array<Record<string, unknown>> }>(
+        'user.rpc.professionals.search',
+        { role, query: query.trim() },
+      );
+      return body.items ?? [];
+    } catch {
       throw new ServiceUnavailableException('professional lookup is currently unavailable');
     }
-    const body = (await res.json()) as { items?: Array<Record<string, unknown>> };
-    return body.items ?? [];
   }
 
   /** Product-service internal listing row (no secret): includes product-type pricing flags. */
@@ -325,14 +322,10 @@ export class TransactionsService {
   ): Promise<{ lawyerPricingEnabled: boolean; agentPricingEnabled: boolean } | null> {
     if (!productId) return null;
     try {
-      const res = await fetch(
-        `${this.productServiceUrl()}/products/internal/${encodeURIComponent(productId)}`,
-      );
-      if (!res.ok) return null;
-      const body = (await res.json()) as {
+      const body = await this.rabbit.rpc<{
         lawyerPricingEnabled?: boolean;
         agentPricingEnabled?: boolean;
-      };
+      }>('product.rpc.product.get', { productId });
       return {
         lawyerPricingEnabled: body.lawyerPricingEnabled === true,
         agentPricingEnabled: body.agentPricingEnabled === true,
@@ -343,15 +336,18 @@ export class TransactionsService {
   }
 
   private async ensurePersonalKycApproved(userId: string): Promise<void> {
-    const res = await fetch(
-      `${this.userServiceUrl()}/users/kyc/personal-status?userId=${encodeURIComponent(userId)}`,
-    );
-    if (!res.ok) {
+    try {
+      const body = await this.rabbit.rpc<{ approved?: boolean }>(
+        'user.rpc.kyc.personal.status',
+        { userId },
+      );
+      if (!body.approved) {
+        throw new ConflictException('complete KYC before creating transactions');
+      }
+    } catch (e) {
+      console.error('KYC verification failed:', e);
+      if (e instanceof ConflictException) throw e;
       throw new ServiceUnavailableException('could not verify KYC status');
-    }
-    const body = (await res.json()) as { approved?: boolean };
-    if (!body.approved) {
-      throw new ConflictException('complete KYC before creating transactions');
     }
   }
 
@@ -512,19 +508,20 @@ export class TransactionsService {
       );
     }
     const fundedBy = TransactionFundingParty.COUNTERPARTY;
-    const productRes = await fetch(
-      `${this.productServiceUrl()}/products/internal/${encodeURIComponent(dto.productId)}`,
-    );
-    if (!productRes.ok) {
-      throw new NotFoundException('product not found');
-    }
-    const productRow = (await productRes.json()) as {
+    let productRow: {
       id: string;
       sellerUserId: string;
       title: string;
       price: string;
       productTypeCode?: string;
     };
+    try {
+      productRow = await this.rabbit.rpc('product.rpc.product.get', {
+        productId: dto.productId,
+      });
+    } catch {
+      throw new NotFoundException('product not found');
+    }
     if (productRow.sellerUserId !== sellerId) {
       throw new ConflictException('selected product must belong to the seller creating this transaction');
     }
@@ -1221,29 +1218,17 @@ export class TransactionsService {
     actorId: string;
     productTitle: string;
   }): Promise<void> {
-    const secret = this.resolveInternalApiSecret();
-    const res = await fetch(
-      `${this.escrowServiceUrl()}/escrow/wallet/transactions/${encodeURIComponent(params.transactionId)}/refund-to-buyer`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Internal-Secret': secret,
-        },
-        body: JSON.stringify({
-          buyerUserId: params.buyerId,
-          amount: params.amount,
-          actorId: params.actorId,
-          productTitle: params.productTitle,
-        }),
-      },
-    );
-    if (!res.ok) {
-      const text = await res.text();
+    try {
+      await this.rabbit.rpc('escrow.rpc.wallet.refund-to-buyer', {
+        transactionId: params.transactionId,
+        buyerUserId: params.buyerId,
+        amount: params.amount,
+        actorId: params.actorId,
+        productTitle: params.productTitle,
+      });
+    } catch (e) {
       throw new ServiceUnavailableException(
-        text
-          ? `escrow could not refund buyer: ${text.slice(0, 240)}`
-          : `escrow could not refund buyer (${res.status})`,
+        `escrow could not refund buyer via RPC: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
   }
@@ -1306,29 +1291,17 @@ export class TransactionsService {
     actorId: string;
     productTitle: string;
   }): Promise<void> {
-    const secret = this.resolveInternalApiSecret();
-    const res = await fetch(
-      `${this.escrowServiceUrl()}/escrow/wallet/transactions/${encodeURIComponent(params.transactionId)}/settle-to-seller`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Internal-Secret': secret,
-        },
-        body: JSON.stringify({
-          sellerUserId: params.sellerId,
-          amount: params.amount,
-          actorId: params.actorId,
-          productTitle: params.productTitle,
-        }),
-      },
-    );
-    if (!res.ok) {
-      const text = await res.text();
+    try {
+      await this.rabbit.rpc('escrow.rpc.wallet.settle-to-seller', {
+        transactionId: params.transactionId,
+        sellerUserId: params.sellerId,
+        amount: params.amount,
+        actorId: params.actorId,
+        productTitle: params.productTitle,
+      });
+    } catch (e) {
       throw new ServiceUnavailableException(
-        text
-          ? `escrow could not release funds to seller: ${text.slice(0, 240)}`
-          : `escrow could not release funds to seller (${res.status})`,
+        `escrow could not release funds to seller via RPC: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
   }
@@ -1664,17 +1637,10 @@ export class TransactionsService {
   } | null> {
     if (!userId) return null;
     try {
-      const res = await fetch(
-        `${this.userServiceUrl()}/users/search?query=${encodeURIComponent(userId)}`,
-      );
-      if (res.status === 404) return null;
-      if (!res.ok) return null;
-      const row = (await res.json()) as {
-        id: string;
-        displayName?: string | null;
-        email?: string | null;
-        phone?: string | null;
-      };
+      const row = await this.rabbit.rpc<any>('user.rpc.user.search', {
+        query: userId,
+      });
+      if (!row) return null;
       return {
         id: row.id,
         displayName: row.displayName ?? null,
@@ -1686,29 +1652,15 @@ export class TransactionsService {
     }
   }
 
-  private resolveInternalApiSecretForProductFetch(): string | null {
-    const fromEnv = process.env.INTERNAL_API_SECRET?.trim();
-    if (fromEnv) return fromEnv;
-    if (process.env.NODE_ENV === 'production') return null;
-    return DEV_FALLBACK_INTERNAL_API_SECRET;
-  }
-
   /** Full product row from product-service (images, attributes). */
   private async fetchProductSnapshotForRoom(
     productId: string | null | undefined,
   ): Promise<Record<string, unknown> | null> {
     if (!productId) return null;
-    const secret = this.resolveInternalApiSecretForProductFetch();
-    if (!secret) {
-      return null;
-    }
-    const url = `${this.productServiceUrl()}/products/internal/full/${encodeURIComponent(productId)}`;
     try {
-      const res = await fetch(url, {
-        headers: { 'x-internal-secret': secret },
+      return await this.rabbit.rpc<Record<string, unknown>>('product.rpc.product.get-full', {
+        productId,
       });
-      if (!res.ok) return null;
-      return (await res.json()) as Record<string, unknown>;
     } catch {
       return null;
     }
