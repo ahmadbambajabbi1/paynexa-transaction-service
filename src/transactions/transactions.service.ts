@@ -19,7 +19,8 @@ import { CreatePublicTransactionDto, CreateTransactionDto } from '../dto/create-
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { RabbitmqService } from '../infrastructure/rabbitmq/rabbitmq.service';
 import { SmsService } from '../infrastructure/sms/sms.service';
-import { Observable, Subject } from 'rxjs';
+import { TransactionNotificationsService } from '../notifications/transaction-notifications.service';
+import { Observable } from 'rxjs';
 
 /** Matches product-service `.env.example`; used only when `INTERNAL_API_SECRET` is unset and `NODE_ENV` is not production. */
 const DEV_FALLBACK_INTERNAL_API_SECRET = 'change-me';
@@ -243,7 +244,7 @@ function defaultParticipantInviteMessage(opts: {
   return [
     'Hello,',
     '',
-    `${opts.inviterLabel} (${opts.partySide}) would like to invite you to act as the ${roleWord} for their side of an escrow transaction on SafeTrade.`,
+    `${opts.inviterLabel} (${opts.partySide}) would like to invite you to act as the ${roleWord} for their side of a PayNexa transaction.`,
     '',
     `Product: ${opts.productTitle}`,
     `Amount: ${opts.amount}`,
@@ -273,12 +274,11 @@ function roleToBuyerSeller(
 
 @Injectable()
 export class TransactionsService {
-  private readonly notifications$ = new Subject<MessageEvent>();
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly rabbit: RabbitmqService,
     private readonly sms: SmsService,
+    private readonly notificationEvents: TransactionNotificationsService,
   ) {}
 
   /** Defaults match api-gateway dev URLs so local runs work without a full .env. */
@@ -439,6 +439,24 @@ export class TransactionsService {
     };
   }
 
+  async resolveOptionalViewerId(
+    authorization?: string,
+    deviceId?: string,
+  ): Promise<string | undefined> {
+    if (!authorization?.startsWith('Bearer ') || !deviceId?.trim()) {
+      return undefined;
+    }
+    try {
+      const session = await this.rabbit.rpc<{ user?: { id?: string } }>(
+        'user.rpc.session.resolve',
+        { authorization, deviceId },
+      );
+      return session.user?.id;
+    } catch {
+      return undefined;
+    }
+  }
+
   async listNotifications(userId?: string): Promise<Record<string, unknown>> {
     if (!userId) {
       throw new BadRequestException('userId query required');
@@ -464,7 +482,7 @@ export class TransactionsService {
 
   notificationsStream(userId: string): Observable<MessageEvent> {
     return new Observable<MessageEvent>((subscriber) => {
-      const sub = this.notifications$.subscribe((event) => {
+      const sub = this.notificationEvents.notificationsSubject.subscribe((event) => {
         const payload = event.data as { recipientId?: string };
         if (payload.recipientId === userId) {
           subscriber.next(event);
@@ -479,7 +497,7 @@ export class TransactionsService {
       where: { id },
       data: { readAt: new Date() },
     });
-    this.notifications$.next({
+    this.notificationEvents.notificationsSubject.next({
       data: {
         type: 'notification.read',
         id: row.id,
@@ -577,13 +595,6 @@ export class TransactionsService {
               },
             ],
           },
-          notifications: {
-            create: {
-              recipientId: buyerId,
-              message: `You were invited to escrow transaction for "${productRow.title}"`,
-              role: 'buyer',
-            },
-          },
         },
       });
       if (documents.length > 0) {
@@ -607,13 +618,13 @@ export class TransactionsService {
         role: 'buyer',
       });
     }
-    this.notifications$.next({
-      data: {
-        type: 'notification.created',
-        recipientId: buyerId,
-        transactionId: transaction.id,
-        message: `You were invited to escrow transaction for "${productRow.title}"`,
-      },
+    await this.notificationEvents.notify({
+      transactionId: transaction.id,
+      recipientId: buyerId,
+      role: 'buyer',
+      eventType: 'transaction.invited',
+      title: 'Transaction invitation',
+      message: `You were invited to a PayNexa transaction for "${productRow.title}".`,
     });
 
     await this.rabbit.publish('transaction.created', {
@@ -745,6 +756,37 @@ export class TransactionsService {
     });
   }
 
+  /** Resolves a public pay-link ref to the shareable template and optional buyer order row. */
+  private async resolvePublicCheckout(ref: string) {
+    const row = await this.findTransactionByPublicRef(ref);
+    if (!row || row.workflow !== TransactionWorkflow.PUBLIC_SHAREABLE) {
+      throw new NotFoundException('transaction not found');
+    }
+    if (row.sourceShareTransactionId) {
+      const template = await this.prisma.transaction.findUnique({
+        where: { id: row.sourceShareTransactionId },
+      });
+      if (!template || template.workflow !== TransactionWorkflow.PUBLIC_SHAREABLE) {
+        throw new NotFoundException('transaction not found');
+      }
+      return { template, order: row };
+    }
+    return { template: row, order: null };
+  }
+
+  private async findBuyerOrderForTemplate(
+    templateId: string,
+    buyerId: string,
+  ) {
+    return this.prisma.transaction.findFirst({
+      where: {
+        sourceShareTransactionId: templateId,
+        buyerId,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
   private normalizePublicDeviceId(value: string | undefined): string | null {
     const clean = String(value ?? '').trim();
     return clean ? clean.slice(0, 128) : null;
@@ -753,11 +795,11 @@ export class TransactionsService {
   private async recordPublicView(
     transactionId: string,
     view?: PublicViewContext,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const deviceId = this.normalizePublicDeviceId(view?.deviceId);
     const userAgent = String(view?.userAgent ?? '').trim().slice(0, 512) || null;
     const viewerUserId = String(view?.viewerUserId ?? '').trim() || null;
-    if (!deviceId && !userAgent && !viewerUserId) return;
+    if (!deviceId && !userAgent && !viewerUserId) return false;
 
     // Deduplicate: if this device or user already viewed, do not count again
     if (deviceId || viewerUserId) {
@@ -770,19 +812,22 @@ export class TransactionsService {
           ],
         },
       });
-      if (existing) return;
+      if (existing) return false;
     }
 
-    await this.prisma.transactionPublicView
-      .create({
+    try {
+      await this.prisma.transactionPublicView.create({
         data: {
           transactionId,
           deviceId,
           viewerUserId,
           userAgent,
         },
-      })
-      .catch(() => undefined);
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async getPublicAnalytics(tx: PublicAnalyticsSource): Promise<Record<string, unknown>> {
@@ -833,42 +878,59 @@ export class TransactionsService {
     id: string,
     view?: PublicViewContext,
   ): Promise<Record<string, unknown>> {
-    const tx = await this.findTransactionByPublicRef(id);
-    if (!tx) throw new NotFoundException('transaction not found');
-    if (tx.workflow !== TransactionWorkflow.PUBLIC_SHAREABLE) {
-      throw new NotFoundException('transaction not found');
+    const { template, order } = await this.resolvePublicCheckout(id);
+    const isNewView = await this.recordPublicView(template.id, view);
+    if (isNewView) {
+      await this.notificationEvents.notify({
+        transactionId: template.id,
+        recipientId: template.sellerId,
+        role: 'seller',
+        eventType: 'transaction.public_viewed',
+        title: 'Payment link viewed',
+        message: `Someone viewed your PayNexa payment link for "${template.productTitle}".`,
+      });
     }
-    await this.recordPublicView(tx.id, view);
-    const seller = await this.lookupPartyProfile(tx.sellerId);
+    const seller = await this.lookupPartyProfile(template.sellerId);
     let terms: Record<string, unknown> = {};
     try {
-      terms = JSON.parse(tx.terms) as Record<string, unknown>;
+      terms = JSON.parse(template.terms) as Record<string, unknown>;
     } catch {
       terms = {};
     }
-    const amount = tx.amount.toString();
+    const amount = template.amount.toString();
     const protectionFee = typeof terms.protectionFee === 'string' ? terms.protectionFee : '0.00';
     const totalBuyerPays = typeof terms.totalBuyerPays === 'string' ? terms.totalBuyerPays : amount;
+    const viewerOrder =
+      order ??
+      (view?.viewerUserId
+        ? await this.findBuyerOrderForTemplate(template.id, view.viewerUserId)
+        : null);
+    const responseStatus = viewerOrder?.status ?? template.status;
+    const responseBuyerId = viewerOrder?.buyerId ?? null;
+    const payTransactionId = viewerOrder?.id ?? template.id;
     return {
-      id: tx.id,
-      workflow: tx.workflow,
-      shareToken: tx.shareToken,
-      sharePath: tx.shareToken ? `/pay/${tx.shareToken}` : `/pay/${tx.id}`,
-      sellerId: tx.sellerId,
-      buyerId: tx.buyerId,
+      id: payTransactionId,
+      templateId: template.id,
+      workflow: template.workflow,
+      shareToken: template.shareToken,
+      sharePath: template.shareToken
+        ? `/pay/${template.shareToken}`
+        : `/pay/${template.id}`,
+      sellerId: template.sellerId,
+      buyerId: responseBuyerId,
       seller: seller?.displayName || seller?.phone || seller?.email || 'Seller',
-      item: tx.productTitle,
+      item: template.productTitle,
       itemDescription:
         typeof terms.itemDescription === 'string' && terms.itemDescription.trim()
           ? terms.itemDescription
           : null,
-      quantity: tx.quantity,
-      unitPrice: tx.unitPrice?.toString() ?? amount,
+      quantity: template.quantity,
+      unitPrice: template.unitPrice?.toString() ?? amount,
       amount,
       protectionFee,
       totalBuyerPays,
       deliveryNeeded: terms.deliveryNeeded === true,
-      status: tx.status,
+      status: responseStatus,
       sellerNote: typeof terms.sellerNote === 'string' && terms.sellerNote.trim() ? terms.sellerNote : null,
     };
   }
@@ -882,99 +944,142 @@ export class TransactionsService {
     if (!buyerId) {
       throw new BadRequestException('actorId required');
     }
-    const tx = await this.findTransactionByPublicRef(ref);
-    if (!tx) throw new NotFoundException('transaction not found');
-    if (tx.workflow !== TransactionWorkflow.PUBLIC_SHAREABLE) {
-      throw new ConflictException('only public shareable transactions can be claimed');
-    }
-    if (tx.sellerId === buyerId) {
+    const { template, order } = await this.resolvePublicCheckout(ref);
+    if (template.sellerId === buyerId) {
       throw new ConflictException('seller cannot buy their own public transaction');
     }
-    if (tx.buyerId && tx.buyerId !== buyerId) {
-      throw new ConflictException('this public transaction is already assigned to another buyer');
-    }
-    if (tx.buyerId && tx.buyerId === buyerId) {
-      return {
-        transactionId: tx.id,
-        workflow: tx.workflow,
-        buyerId: tx.buyerId,
-        status: tx.status,
-        event: 'public.claimed',
-      };
-    }
 
-    const accepted = Array.from(new Set([tx.sellerId, buyerId]));
-    const status = TransactionStatus.AWAITING_FUNDING;
     const deviceId = this.normalizePublicDeviceId(deviceIdRaw);
     const now = new Date();
 
-    const updatedTx = await this.prisma.transaction.update({
-      where: { id: tx.id },
-      data: {
+    const existingOrder =
+      order?.buyerId === buyerId
+        ? order
+        : await this.findBuyerOrderForTemplate(template.id, buyerId);
+
+    if (existingOrder) {
+      return {
+        transactionId: existingOrder.id,
+        workflow: template.workflow,
         buyerId,
-        status,
+        status: existingOrder.status,
+        event: 'public.claimed',
+        alreadyClaimed: true,
+      };
+    }
+
+    // Legacy rows: buyer was assigned directly on the template (shareToken cleared).
+    if (!template.shareToken && template.buyerId) {
+      if (template.buyerId !== buyerId) {
+        throw new ConflictException(
+          'this public transaction is already assigned to another buyer',
+        );
+      }
+      return {
+        transactionId: template.id,
+        workflow: template.workflow,
+        buyerId,
+        status: template.status,
+        event: 'public.claimed',
+        alreadyClaimed: true,
+      };
+    }
+
+    if (!template.shareToken) {
+      throw new NotFoundException('transaction not found');
+    }
+
+    const accepted = Array.from(new Set([template.sellerId, buyerId]));
+    const status = TransactionStatus.AWAITING_FUNDING;
+    const buyerOrder = await this.prisma.transaction.create({
+      data: {
+        workflow: TransactionWorkflow.PUBLIC_SHAREABLE,
+        sourceShareTransactionId: template.id,
         shareToken: null,
+        type: template.type,
+        productId: template.productId,
+        productTitle: template.productTitle,
+        quantity: template.quantity,
+        unitPrice: template.unitPrice,
+        amount: template.amount,
+        buyerId,
+        sellerId: template.sellerId,
+        createdByUserId: template.sellerId,
+        fundedBy: template.fundedBy,
+        terms: template.terms,
+        status,
         acceptedPartyIds: { set: accepted },
+        agreements: {
+          create: {
+            version: 1,
+            content: template.terms,
+            actorId: buyerId,
+          },
+        },
         auditLogs: {
           create: [
             {
-              action: 'public.claimed',
+              action: 'public.checkout_started',
               actorId: buyerId,
-              detail: 'buyer claimed the shared transaction directly',
+              detail: 'buyer started checkout from shared payment link',
             },
             {
               action: 'transaction.accepted',
               actorId: buyerId,
-              detail: 'buyer accepted transaction automatically on claiming',
+              detail: 'buyer accepted transaction on checkout',
             },
           ],
-        },
-        notifications: {
-          create: {
-            recipientId: tx.sellerId,
-            message: `A buyer opened your shared transaction for "${tx.productTitle}"`,
-            role: 'seller',
-          },
         },
       },
     });
 
     if (deviceId) {
-      await this.prisma.transactionPublicView.create({
-        data: {
-          transactionId: tx.id,
-          deviceId,
-          viewerUserId: buyerId,
-          convertedAt: now,
-        },
-      }).catch(() => undefined);
+      await this.prisma.transactionPublicView
+        .create({
+          data: {
+            transactionId: template.id,
+            deviceId,
+            viewerUserId: buyerId,
+            convertedAt: now,
+          },
+        })
+        .catch(() => undefined);
     }
 
-    await this.rabbit.publish('transaction.updated', {
-      transactionId: tx.id,
-      workflow: tx.workflow,
-      sellerId: tx.sellerId,
+    await this.rabbit.publish('transaction.created', {
+      transactionId: buyerOrder.id,
+      workflow: buyerOrder.workflow,
       buyerId,
-      type: tx.type,
-      status: status,
+      sellerId: template.sellerId,
+      type: buyerOrder.type,
       occurredAt: now.toISOString(),
     });
 
-    this.notifications$.next({
-      data: {
-        type: 'notification.created',
-        recipientId: tx.sellerId,
-        transactionId: tx.id,
-        message: `A buyer opened your shared transaction for "${tx.productTitle}"`,
-      },
+    await this.rabbit.publish('transaction.updated', {
+      transactionId: buyerOrder.id,
+      workflow: buyerOrder.workflow,
+      sellerId: template.sellerId,
+      buyerId,
+      type: buyerOrder.type,
+      status,
+      occurredAt: now.toISOString(),
+    });
+
+    await this.notificationEvents.notify({
+      transactionId: buyerOrder.id,
+      recipientId: template.sellerId,
+      role: 'seller',
+      eventType: 'transaction.public_checkout_started',
+      title: 'Buyer started checkout',
+      message: `A buyer started checkout for "${template.productTitle}".`,
     });
 
     return {
-      transactionId: tx.id,
-      workflow: tx.workflow,
-      buyerId: buyerId,
-      status: status,
-      event: 'public.claimed',
+      transactionId: buyerOrder.id,
+      workflow: buyerOrder.workflow,
+      buyerId,
+      status,
+      event: 'public.checkout_started',
     };
   }
 
@@ -1022,6 +1127,17 @@ export class TransactionsService {
       status: updated.status,
       occurredAt: new Date().toISOString(),
     });
+
+    await this.notificationEvents.notifyAccepted(
+      {
+        id: updated.id,
+        buyerId: existing.buyerId,
+        sellerId: existing.sellerId,
+        productTitle: existing.productTitle,
+      },
+      actorId,
+      updated.status,
+    );
 
     return {
       transactionId: updated.id,
@@ -1137,6 +1253,16 @@ export class TransactionsService {
         occurredAt: new Date().toISOString(),
       });
     }
+    await this.notificationEvents.notifyStateChange(
+      {
+        id: transaction.id,
+        buyerId: transaction.buyerId,
+        sellerId: transaction.sellerId,
+        productTitle: transaction.productTitle,
+      },
+      next,
+      actorId,
+    );
     return { transactionId: updated.id, status: updated.status };
   }
 
@@ -1190,6 +1316,15 @@ export class TransactionsService {
         },
       },
     });
+    await this.notificationEvents.notifyFunded(
+      {
+        id: updated.id,
+        buyerId: transaction.buyerId,
+        sellerId: transaction.sellerId,
+        productTitle: transaction.productTitle,
+      },
+      actorId,
+    );
     return {
       transactionId: updated.id,
       status: updated.status,
@@ -1405,23 +1540,16 @@ export class TransactionsService {
             detail: `message=${message.slice(0, 500)}`,
           },
         },
-        notifications: {
-          create: {
-            recipientId: participantUserId,
-            message,
-            role: notifRole,
-          },
-        },
       },
     });
 
-    this.notifications$.next({
-      data: {
-        type: 'notification.created',
-        recipientId: participantUserId,
-        transactionId: id,
-        message,
-      },
+    await this.notificationEvents.notify({
+      transactionId: id,
+      recipientId: participantUserId,
+      message,
+      role: notifRole,
+      eventType: 'transaction.participant_invited',
+      title: 'Transaction invitation',
     });
     return {
       transactionId: id,
@@ -1469,6 +1597,21 @@ export class TransactionsService {
         },
       },
     });
+    const inviterId =
+      partySide === 'buyer' ? tx.buyerId ?? '' : tx.sellerId;
+    if (inviterId) {
+      await this.notificationEvents.notifyParticipantAccepted(
+        {
+          id: tx.id,
+          buyerId: tx.buyerId,
+          sellerId: tx.sellerId,
+          productTitle: tx.productTitle,
+        },
+        inviterId,
+        partySide,
+        role,
+      );
+    }
     return { transactionId: id, role, partySide, status: 'ACCEPTED' };
   }
 
@@ -1530,6 +1673,16 @@ export class TransactionsService {
       reason,
       occurredAt: new Date().toISOString(),
     });
+    await this.notificationEvents.notifyDisputeOpened(
+      {
+        id: transaction.id,
+        buyerId: transaction.buyerId,
+        sellerId: transaction.sellerId,
+        productTitle: transaction.productTitle,
+      },
+      actorId,
+      reason,
+    );
     return {
       transactionId: updated.id,
       status: updated.status,

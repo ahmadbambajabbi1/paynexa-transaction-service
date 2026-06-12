@@ -4,6 +4,7 @@ import { TransactionEventsListener } from './infrastructure/events/transaction-e
 import { PrismaModule } from './infrastructure/prisma/prisma.module';
 import { RabbitmqModule } from './infrastructure/rabbitmq/rabbitmq.module';
 import { SmsModule } from './infrastructure/sms/sms.module';
+import { NotificationsModule } from './notifications/notifications.module';
 import { TransactionsController } from './transactions/transactions.controller';
 import { TransactionsService } from './transactions/transactions.service';
 
@@ -15,6 +16,7 @@ import { RabbitmqRpcConsumer } from './infrastructure/rabbitmq/rabbitmq-rpc.cons
     PrismaModule,
     RabbitmqModule,
     SmsModule,
+    NotificationsModule,
   ],
   controllers: [TransactionsController],
   providers: [TransactionsService, TransactionEventsListener, RabbitmqRpcConsumer],
