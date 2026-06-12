@@ -70,14 +70,20 @@ export class TransactionsController {
   }
 
   @Get('public/:id')
-  getPublicSummary(
+  async getPublicSummary(
     @Param('id') id: string,
     @Headers('x-device-id') deviceId?: string,
     @Headers('user-agent') userAgent?: string,
+    @Headers('authorization') authorization?: string,
   ): Promise<Record<string, unknown>> {
+    const viewerUserId = await this.transactions.resolveOptionalViewerId(
+      authorization,
+      deviceId,
+    );
     return this.transactions.getPublicTransactionSummary(id, {
       deviceId,
       userAgent,
+      viewerUserId,
     });
   }
 

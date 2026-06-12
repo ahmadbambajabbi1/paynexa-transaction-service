@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { TransactionStatus } from '@prisma/client';
+import { TransactionNotificationsService } from '../../notifications/transaction-notifications.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { RabbitmqService } from '../rabbitmq/rabbitmq.service';
 
@@ -16,6 +17,7 @@ export class TransactionEventsListener implements OnModuleInit {
   constructor(
     private readonly rabbit: RabbitmqService,
     private readonly prisma: PrismaService,
+    private readonly notificationEvents: TransactionNotificationsService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -46,6 +48,7 @@ export class TransactionEventsListener implements OnModuleInit {
     ) {
       return;
     }
+    const actorId = payload.actorId ?? tx.buyerId ?? 'system';
     await this.prisma.transaction.update({
       where: { id: tx.id },
       data: {
@@ -53,12 +56,21 @@ export class TransactionEventsListener implements OnModuleInit {
         auditLogs: {
           create: {
             action: 'payment.funded',
-            actorId: payload.actorId ?? tx.buyerId ?? 'system',
+            actorId,
             detail: payload.amount ? `amount=${payload.amount}` : 'wallet payment funded escrow',
           },
         },
       },
     });
+    await this.notificationEvents.notifyFunded(
+      {
+        id: tx.id,
+        buyerId: tx.buyerId,
+        sellerId: tx.sellerId,
+        productTitle: tx.productTitle,
+      },
+      actorId,
+    );
     this.logger.log(`Marked transaction ${tx.id} as FUNDED`);
   }
 }
