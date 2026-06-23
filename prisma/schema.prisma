@@ -41,6 +41,24 @@ enum ParticipantInviteStatus {
   ACCEPTED
 }
 
+enum PlatformFeeType {
+  NONE
+  PERCENTAGE
+  FIXED
+  COMBINED
+}
+
+enum DisputeStatus {
+  OPEN
+  COUNTERED
+  RESOLVED
+}
+
+enum DisputeResolution {
+  RELEASE_TO_SELLER
+  REFUND_TO_BUYER
+}
+
 model Transaction {
   id          String             @id @default(uuid())
   workflow    TransactionWorkflow @default(ESCROW_TWO_PARTY)
@@ -55,6 +73,13 @@ model Transaction {
   quantity    Int                @default(1)
   unitPrice   Decimal?           @db.Decimal(18, 2)
   amount      Decimal            @db.Decimal(18, 2)
+  currencyCode String            @default("USD") @db.VarChar(3)
+  platformFeeAmount Decimal?     @db.Decimal(18, 2)
+  platformFeeType   PlatformFeeType?
+  platformFeePercent Decimal?    @db.Decimal(8, 4)
+  platformFeeFixed   Decimal?     @db.Decimal(18, 2)
+  sellerNetAmount    Decimal?    @db.Decimal(18, 2)
+  deliveryDetails    Json?
   buyerId     String?
   sellerId    String
   createdByUserId String
@@ -77,6 +102,40 @@ model Transaction {
   auditLogs   TransactionAudit[]
   notifications TransactionNotification[]
   publicViews TransactionPublicView[]
+  disputes    TransactionDispute[]
+}
+
+model TransactionDispute {
+  id                String            @id @default(uuid())
+  transactionId     String
+  transaction       Transaction       @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  raisedByUserId    String
+  raisedByRole      String
+  description       String            @db.VarChar(500)
+  parentDisputeId   String?
+  parentDispute     TransactionDispute?  @relation("DisputeThread", fields: [parentDisputeId], references: [id], onDelete: SetNull)
+  counterDisputes   TransactionDispute[] @relation("DisputeThread")
+  status            DisputeStatus     @default(OPEN)
+  resolution        DisputeResolution?
+  resolutionReason  String?
+  internalNotes     String?
+  resolvedByAdminId String?
+  resolvedAt        DateTime?
+  createdAt         DateTime          @default(now())
+  responses         TransactionDisputeResponse[]
+
+  @@index([transactionId, createdAt])
+  @@index([status])
+}
+
+model TransactionDisputeResponse {
+  id        String             @id @default(uuid())
+  disputeId String
+  dispute   TransactionDispute @relation(fields: [disputeId], references: [id], onDelete: Cascade)
+  actorId   String
+  actorRole String
+  message   String             @db.VarChar(500)
+  createdAt DateTime           @default(now())
 }
 
 model TransactionPublicView {

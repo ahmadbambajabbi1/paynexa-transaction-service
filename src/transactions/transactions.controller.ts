@@ -16,7 +16,7 @@ import { ActorDto } from '../dto/actor.dto';
 import { AddDocumentDto } from '../dto/add-document.dto';
 import { AgreementDto } from '../dto/agreement.dto';
 import { CreatePublicTransactionDto, CreateTransactionDto } from '../dto/create-transaction.dto';
-import { DisputeDto } from '../dto/dispute.dto';
+import { RaiseDisputeDto, DisputeResponseDto, ApproveReleaseDto, DeliveryDetailsDto } from '../dto/dispute.dto';
 import { InviteParticipantDto } from '../dto/invite-participant.dto';
 import { ParticipantRoleDto } from '../dto/participant-role.dto';
 import { UpdateStateDto } from '../dto/update-state.dto';
@@ -120,6 +120,7 @@ export class TransactionsController {
     return this.transactions.createPublicTransaction(dto);
   }
 
+  /** Reserved for the wallet payment flow — clients must not call this before payment succeeds. */
   @Patch('public/:id/claim')
   claimPublic(
     @Param('id') id: string,
@@ -202,8 +203,33 @@ export class TransactionsController {
   @Post(':id/dispute')
   dispute(
     @Param('id') id: string,
-    @Body() dto: DisputeDto,
-  ): Promise<Record<string, unknown>> {
-    return this.transactions.raiseDispute(id, dto.actorId, dto.reason);
+    @Body() dto: RaiseDisputeDto,
+  ) {
+    return this.transactions.raiseDispute(id, dto.actorId, dto.reason, dto.parentDisputeId);
+  }
+
+  @Post(':id/dispute/:disputeId/respond')
+  respondToDispute(
+    @Param('id') id: string,
+    @Param('disputeId') disputeId: string,
+    @Body() dto: DisputeResponseDto,
+  ) {
+    return this.transactions.respondToDispute(id, disputeId, dto.actorId, dto.message);
+  }
+
+  @Post(':id/dispute/approve-release')
+  approveDisputeRelease(@Param('id') id: string, @Body() dto: ApproveReleaseDto) {
+    return this.transactions.approveDisputeRelease(id, dto.actorId);
+  }
+
+  @Post(':id/delivery')
+  saveDelivery(@Param('id') id: string, @Body() dto: DeliveryDetailsDto) {
+    const { actorId, ...details } = dto;
+    return this.transactions.saveDeliveryDetails(id, actorId, details);
+  }
+
+  @Get(':id/disputes')
+  listDisputes(@Param('id') id: string) {
+    return this.transactions.getDisputesForTransaction(id);
   }
 }

@@ -21,6 +21,17 @@ import { RabbitmqService } from '../infrastructure/rabbitmq/rabbitmq.service';
 import { SmsService } from '../infrastructure/sms/sms.service';
 import { TransactionNotificationsService } from '../notifications/transaction-notifications.service';
 import { Observable } from 'rxjs';
+import { TransactionFeeConfigService } from '../fees/transaction-fee-config.service';
+import { calculatePlatformFee, formatFeeTypeLabel } from '../fees/platform-fee.util';
+import { resolveTransactionCurrency } from './transaction-currency.util';
+import { hydrateTransactionFeeFields } from './transaction-fee-hydrate.util';
+import {
+  buildMergedThread,
+  mapUnifiedDispute,
+  partyHasComplaint,
+  pickPrimaryDispute,
+} from '../disputes/dispute-thread.util';
+import { DisputeStatus, PlatformFeeType, Prisma } from '@prisma/client';
 
 /** Matches product-service `.env.example`; used only when `INTERNAL_API_SECRET` is unset and `NODE_ENV` is not production. */
 const DEV_FALLBACK_INTERNAL_API_SECRET = 'change-me';
@@ -279,6 +290,7 @@ export class TransactionsService {
     private readonly rabbit: RabbitmqService,
     private readonly sms: SmsService,
     private readonly notificationEvents: TransactionNotificationsService,
+    private readonly feeConfig: TransactionFeeConfigService,
   ) {}
 
   /** Defaults match api-gateway dev URLs so local runs work without a full .env. */
@@ -292,6 +304,72 @@ export class TransactionsService {
     const raw =
       process.env.PRODUCT_SERVICE_URL?.trim() || 'http://127.0.0.1:5005';
     return raw.replace(/\/$/, '');
+  }
+
+  private async resolveSellerCurrency(sellerId: string): Promise<string> {
+    try {
+      const row = await this.rabbit.rpc<{ currency?: string }>(
+        'escrow.rpc.wallet.currency-get',
+        { userId: sellerId },
+      );
+      const code = row.currency?.trim().toUpperCase();
+      if (code) return code;
+    } catch {
+      // fall through
+    }
+    return 'USD';
+  }
+
+  private async applyFeeFields(amount: string) {
+    const config = await this.feeConfig.getActiveConfig();
+    const breakdown = calculatePlatformFee(amount, config);
+    return {
+      platformFeeAmount: breakdown.platformFeeAmount,
+      platformFeeType: breakdown.feeType,
+      platformFeePercent: breakdown.platformFeePercent,
+      platformFeeFixed: breakdown.platformFeeFixed,
+      sellerNetAmount: breakdown.sellerNetAmount,
+      feeTypeLabel: formatFeeTypeLabel(breakdown.feeType),
+    };
+  }
+
+  private async ensureTransactionFeesIfMissing(
+    tx: Prisma.TransactionGetPayload<{
+      include: {
+        documents: true;
+        agreements: true;
+        auditLogs: true;
+      };
+    }>,
+  ) {
+    if (tx.platformFeeAmount != null) return tx;
+    const fundedStatuses = new Set<TransactionStatus>([
+      TransactionStatus.FUNDED,
+      TransactionStatus.IN_PROGRESS,
+      TransactionStatus.INSPECTION,
+      TransactionStatus.COMPLETED,
+      TransactionStatus.DISPUTED,
+      TransactionStatus.CLOSED,
+      TransactionStatus.REFUNDED,
+    ]);
+    if (!fundedStatuses.has(tx.status)) return tx;
+    const feeFields = await this.applyFeeFields(tx.amount.toString());
+    if (feeFields.platformFeeType === PlatformFeeType.NONE) return tx;
+    return this.prisma.transaction.update({
+      where: { id: tx.id },
+      data: {
+        platformFeeAmount: feeFields.platformFeeAmount,
+        platformFeeType: feeFields.platformFeeType,
+        platformFeePercent: feeFields.platformFeePercent,
+        platformFeeFixed: feeFields.platformFeeFixed,
+        sellerNetAmount: feeFields.sellerNetAmount,
+      },
+      include: {
+        documents: { orderBy: { createdAt: 'asc' } },
+        agreements: { orderBy: { version: 'asc' } },
+        auditLogs: { orderBy: { createdAt: 'asc' } },
+      },
+    });
   }
 
   private async searchUserDirectory(query: string) {
@@ -547,11 +625,18 @@ export class TransactionsService {
       ? parseType(dto.type)
       : transactionTypeFromProductTypeCode(productRow.productTypeCode);
     const documents = dto.documents ?? [];
+    const currencyCode = await this.resolveSellerCurrency(sellerId);
+    const feeFields = await this.applyFeeFields(productRow.price);
     const terms = JSON.stringify({
       workflow: TransactionWorkflow.ESCROW_TWO_PARTY,
       productId: productRow.id,
       productTitle: productRow.title,
       amount: productRow.price,
+      currencyCode,
+      platformFeeAmount: feeFields.platformFeeAmount,
+      platformFeeType: feeFields.platformFeeType,
+      feeTypeLabel: feeFields.feeTypeLabel,
+      sellerNetAmount: feeFields.sellerNetAmount,
       fundedBy,
       buyerAlwaysFunds: true,
       sellerAutoAccepted: true,
@@ -568,6 +653,12 @@ export class TransactionsService {
           quantity: 1,
           unitPrice: productRow.price,
           amount: productRow.price,
+          currencyCode,
+          platformFeeAmount: feeFields.platformFeeAmount,
+          platformFeeType: feeFields.platformFeeType as PlatformFeeType,
+          platformFeePercent: feeFields.platformFeePercent,
+          platformFeeFixed: feeFields.platformFeeFixed,
+          sellerNetAmount: feeFields.sellerNetAmount,
           buyerId,
           sellerId,
           createdByUserId: sellerId,
@@ -668,6 +759,8 @@ export class TransactionsService {
     const itemDescription = dto.itemDescription?.trim() ?? '';
     const sellerNote = dto.sellerNote?.trim() ?? '';
     const fundedBy = TransactionFundingParty.COUNTERPARTY;
+    const currencyCode = await this.resolveSellerCurrency(sellerId);
+    const feeFields = await this.applyFeeFields(amount);
     const terms = JSON.stringify({
       workflow: TransactionWorkflow.PUBLIC_SHAREABLE,
       itemTitle,
@@ -675,6 +768,11 @@ export class TransactionsService {
       quantity,
       unitPrice: unitPriceText,
       amount,
+      currencyCode,
+      platformFeeAmount: feeFields.platformFeeAmount,
+      platformFeeType: feeFields.platformFeeType,
+      feeTypeLabel: feeFields.feeTypeLabel,
+      sellerNetAmount: feeFields.sellerNetAmount,
       protectionFee: '0.00',
       totalBuyerPays: amount,
       deliveryNeeded: dto.deliveryNeeded === true,
@@ -694,6 +792,12 @@ export class TransactionsService {
         quantity,
         unitPrice: unitPriceText,
         amount,
+        currencyCode,
+        platformFeeAmount: feeFields.platformFeeAmount,
+        platformFeeType: feeFields.platformFeeType as PlatformFeeType,
+        platformFeePercent: feeFields.platformFeePercent,
+        platformFeeFixed: feeFields.platformFeeFixed,
+        sellerNetAmount: feeFields.sellerNetAmount,
         buyerId: null,
         sellerId,
         createdByUserId: sellerId,
@@ -927,6 +1031,14 @@ export class TransactionsService {
       quantity: template.quantity,
       unitPrice: template.unitPrice?.toString() ?? amount,
       amount,
+      currencyCode: resolveTransactionCurrency({
+        currencyCode: template.currencyCode,
+        terms: template.terms,
+      }),
+      platformFeeAmount: template.platformFeeAmount?.toString() ?? null,
+      platformFeeType: template.platformFeeType,
+      feeTypeLabel: formatFeeTypeLabel(template.platformFeeType),
+      sellerNetAmount: template.sellerNetAmount?.toString() ?? null,
       protectionFee,
       totalBuyerPays,
       deliveryNeeded: terms.deliveryNeeded === true,
@@ -991,95 +1103,81 @@ export class TransactionsService {
 
     const accepted = Array.from(new Set([template.sellerId, buyerId]));
     const status = TransactionStatus.AWAITING_FUNDING;
-    const buyerOrder = await this.prisma.transaction.create({
-      data: {
-        workflow: TransactionWorkflow.PUBLIC_SHAREABLE,
-        sourceShareTransactionId: template.id,
-        shareToken: null,
-        type: template.type,
-        productId: template.productId,
-        productTitle: template.productTitle,
-        quantity: template.quantity,
-        unitPrice: template.unitPrice,
-        amount: template.amount,
-        buyerId,
-        sellerId: template.sellerId,
-        createdByUserId: template.sellerId,
-        fundedBy: template.fundedBy,
-        terms: template.terms,
-        status,
-        acceptedPartyIds: { set: accepted },
-        agreements: {
-          create: {
-            version: 1,
-            content: template.terms,
-            actorId: buyerId,
+    let buyerOrder;
+    try {
+      buyerOrder = await this.prisma.transaction.create({
+        data: {
+          workflow: TransactionWorkflow.PUBLIC_SHAREABLE,
+          sourceShareTransactionId: template.id,
+          shareToken: null,
+          type: template.type,
+          productId: template.productId,
+          productTitle: template.productTitle,
+          quantity: template.quantity,
+          unitPrice: template.unitPrice,
+          amount: template.amount,
+          currencyCode: template.currencyCode,
+          platformFeeAmount: template.platformFeeAmount,
+          platformFeeType: template.platformFeeType,
+          platformFeePercent: template.platformFeePercent,
+          platformFeeFixed: template.platformFeeFixed,
+          sellerNetAmount: template.sellerNetAmount,
+          buyerId,
+          sellerId: template.sellerId,
+          createdByUserId: template.sellerId,
+          fundedBy: template.fundedBy,
+          terms: template.terms,
+          status,
+          acceptedPartyIds: { set: accepted },
+          agreements: {
+            create: {
+              version: 1,
+              content: template.terms,
+              actorId: buyerId,
+            },
+          },
+          auditLogs: {
+            create: {
+              action: 'public.checkout_reserved',
+              actorId: buyerId,
+              detail: 'buyer reserved checkout while payment is processed',
+            },
           },
         },
-        auditLogs: {
-          create: [
-            {
-              action: 'public.checkout_started',
-              actorId: buyerId,
-              detail: 'buyer started checkout from shared payment link',
-            },
-            {
-              action: 'transaction.accepted',
-              actorId: buyerId,
-              detail: 'buyer accepted transaction on checkout',
-            },
-          ],
-        },
-      },
-    });
+      });
+    } catch (error) {
+      const retry = await this.findBuyerOrderForTemplate(template.id, buyerId);
+      if (retry) {
+        return {
+          transactionId: retry.id,
+          workflow: template.workflow,
+          buyerId,
+          status: retry.status,
+          event: 'public.claimed',
+          alreadyClaimed: true,
+        };
+      }
+      throw error;
+    }
 
     if (deviceId) {
       await this.prisma.transactionPublicView
-        .create({
-          data: {
+        .updateMany({
+          where: {
             transactionId: template.id,
-            deviceId,
-            viewerUserId: buyerId,
-            convertedAt: now,
+            OR: [{ deviceId }, { viewerUserId: buyerId }],
           },
+          data: { convertedAt: now },
         })
         .catch(() => undefined);
     }
-
-    await this.rabbit.publish('transaction.created', {
-      transactionId: buyerOrder.id,
-      workflow: buyerOrder.workflow,
-      buyerId,
-      sellerId: template.sellerId,
-      type: buyerOrder.type,
-      occurredAt: now.toISOString(),
-    });
-
-    await this.rabbit.publish('transaction.updated', {
-      transactionId: buyerOrder.id,
-      workflow: buyerOrder.workflow,
-      sellerId: template.sellerId,
-      buyerId,
-      type: buyerOrder.type,
-      status,
-      occurredAt: now.toISOString(),
-    });
-
-    await this.notificationEvents.notify({
-      transactionId: buyerOrder.id,
-      recipientId: template.sellerId,
-      role: 'seller',
-      eventType: 'transaction.public_checkout_started',
-      title: 'Buyer started checkout',
-      message: `A buyer started checkout for "${template.productTitle}".`,
-    });
 
     return {
       transactionId: buyerOrder.id,
       workflow: buyerOrder.workflow,
       buyerId,
       status,
-      event: 'public.checkout_started',
+      event: 'public.checkout_reserved',
     };
   }
 
@@ -1214,9 +1312,10 @@ export class TransactionsService {
       await this.settleEscrowToSeller({
         transactionId: transaction.id,
         sellerId: transaction.sellerId,
-        amount: transaction.amount.toString(),
+        amount: transaction.sellerNetAmount?.toString() ?? transaction.amount.toString(),
         actorId,
         productTitle: transaction.productTitle,
+        releaseDespiteFreeze: transaction.status === TransactionStatus.DISPUTED,
       });
     }
     const updated = await this.prisma.transaction.update({
@@ -1303,10 +1402,23 @@ export class TransactionsService {
         `transaction cannot be funded while ${transaction.status}`,
       );
     }
+    const feeFields =
+      transaction.platformFeeAmount == null
+        ? await this.applyFeeFields(transaction.amount.toString())
+        : null;
     const updated = await this.prisma.transaction.update({
       where: { id },
       data: {
         status: TransactionStatus.FUNDED,
+        ...(feeFields
+          ? {
+              platformFeeAmount: feeFields.platformFeeAmount,
+              platformFeeType: feeFields.platformFeeType as PlatformFeeType,
+              platformFeePercent: feeFields.platformFeePercent,
+              platformFeeFixed: feeFields.platformFeeFixed,
+              sellerNetAmount: feeFields.sellerNetAmount,
+            }
+          : {}),
         auditLogs: {
           create: {
             action: 'payment.funded',
@@ -1316,6 +1428,24 @@ export class TransactionsService {
         },
       },
     });
+    if (transaction.sourceShareTransactionId) {
+      await this.prisma.transactionAudit.create({
+        data: {
+          transactionId: transaction.id,
+          action: 'transaction.accepted',
+          actorId,
+          detail: 'buyer joined transaction after successful payment',
+        },
+      });
+      await this.rabbit.publish('transaction.created', {
+        transactionId: updated.id,
+        workflow: updated.workflow,
+        buyerId: transaction.buyerId,
+        sellerId: transaction.sellerId,
+        type: updated.type,
+        occurredAt: new Date().toISOString(),
+      });
+    }
     await this.notificationEvents.notifyFunded(
       {
         id: updated.id,
@@ -1405,8 +1535,18 @@ export class TransactionsService {
       },
       orderBy: { updatedAt: 'desc' },
     });
+    const paidStatuses = new Set<TransactionStatus>([
+      TransactionStatus.FUNDED,
+      TransactionStatus.IN_PROGRESS,
+      TransactionStatus.INSPECTION,
+      TransactionStatus.COMPLETED,
+      TransactionStatus.DISPUTED,
+      TransactionStatus.CLOSED,
+      TransactionStatus.REFUNDED,
+    ]);
+    const paidRows = rows.filter((row) => paidStatuses.has(row.status));
     return Promise.all(
-      rows.map(async (row) => ({
+      paidRows.map(async (row) => ({
         id: row.id,
         buyerId: row.buyerId,
         status: row.status,
@@ -1425,18 +1565,50 @@ export class TransactionsService {
     amount: string;
     actorId: string;
     productTitle: string;
-  }): Promise<void> {
+    releaseDespiteFreeze?: boolean;
+  }): Promise<Record<string, unknown>> {
     try {
-      await this.rabbit.rpc('escrow.rpc.wallet.settle-to-seller', {
-        transactionId: params.transactionId,
-        sellerUserId: params.sellerId,
-        amount: params.amount,
-        actorId: params.actorId,
-        productTitle: params.productTitle,
-      });
+      const result = await this.rabbit.rpc<Record<string, unknown>>(
+        'escrow.rpc.wallet.settle-to-seller',
+        {
+          transactionId: params.transactionId,
+          sellerUserId: params.sellerId,
+          amount: params.amount,
+          actorId: params.actorId,
+          productTitle: params.productTitle,
+          releaseDespiteFreeze: params.releaseDespiteFreeze === true,
+        },
+      );
+      if (result.alreadyReleased !== true) {
+        const released = result.released;
+        const platformFeeCollected = result.platformFeeCollected;
+        const feeTypeRaw = result.platformFeeType;
+        const feeType =
+          typeof feeTypeRaw === 'string' &&
+          Object.values(PlatformFeeType).includes(feeTypeRaw as PlatformFeeType)
+            ? (feeTypeRaw as PlatformFeeType)
+            : undefined;
+        if (typeof released === 'string' && released.length > 0) {
+          await this.prisma.transaction.update({
+            where: { id: params.transactionId },
+            data: {
+              sellerNetAmount: new Prisma.Decimal(released),
+              ...(typeof platformFeeCollected === 'string'
+                ? { platformFeeAmount: new Prisma.Decimal(platformFeeCollected) }
+                : {}),
+              ...(feeType ? { platformFeeType: feeType } : {}),
+            },
+          });
+        }
+      }
+      return result;
     } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      if (errMsg.includes('frozen due to dispute')) {
+        throw new ConflictException('funds are frozen due to dispute');
+      }
       throw new ServiceUnavailableException(
-        `escrow could not release funds to seller via RPC: ${e instanceof Error ? e.message : String(e)}`,
+        `escrow could not release funds to seller via RPC: ${errMsg}`,
       );
     }
   }
@@ -1649,28 +1821,126 @@ export class TransactionsService {
     id: string,
     actorId: string,
     reason: string,
+    parentDisputeId?: string,
   ): Promise<Record<string, unknown>> {
     const transaction = await this.prisma.transaction.findUnique({ where: { id } });
     if (!transaction) {
       throw new NotFoundException('transaction not found');
     }
-    const updated = await this.prisma.transaction.update({
-      where: { id },
-      data: {
+    if (!transaction.buyerId) {
+      throw new ConflictException('transaction has no buyer yet');
+    }
+    const isBuyer = actorId === transaction.buyerId;
+    const isSeller = actorId === transaction.sellerId;
+    if (!isBuyer && !isSeller) {
+      throw new ConflictException('only buyer or seller can raise a dispute');
+    }
+    const raisedByRole = isBuyer ? 'buyer' : 'seller';
+    const cleanReason = reason.trim().slice(0, 500);
+    if (!cleanReason) {
+      throw new BadRequestException('dispute reason is required');
+    }
+
+    const existingDisputes = await this.prisma.transactionDispute.findMany({
+      where: {
+        transactionId: transaction.id,
+        status: { not: DisputeStatus.RESOLVED },
+        resolution: null,
+      },
+      orderBy: { createdAt: 'asc' },
+      include: { responses: true },
+    });
+
+    const primary = pickPrimaryDispute(existingDisputes);
+
+    if (primary) {
+      if (partyHasComplaint(existingDisputes, raisedByRole)) {
+        throw new ConflictException('you already submitted your complaint on this dispute');
+      }
+
+      const child = await this.prisma.$transaction(async (db) => {
+        const created = await db.transactionDispute.create({
+          data: {
+            transactionId: transaction.id,
+            raisedByUserId: actorId,
+            raisedByRole,
+            description: cleanReason,
+            parentDisputeId: primary.id,
+            status: DisputeStatus.COUNTERED,
+          },
+        });
+        await db.transactionDispute.update({
+          where: { id: primary.id },
+          data: { status: DisputeStatus.COUNTERED },
+        });
+        await db.transaction.update({
+          where: { id: transaction.id },
+          data: {
+            status: TransactionStatus.DISPUTED,
+            auditLogs: {
+              create: {
+                action: 'dispute.party_complaint',
+                actorId,
+                detail: cleanReason,
+              },
+            },
+          },
+        });
+        return created;
+      });
+
+      const recipientId =
+        raisedByRole === 'buyer' ? transaction.sellerId : transaction.buyerId;
+      if (recipientId) {
+        await this.notificationEvents.notify({
+          transactionId: transaction.id,
+          recipientId,
+          role: raisedByRole === 'buyer' ? 'seller' : 'buyer',
+          eventType: 'transaction.dispute_opened',
+          title: 'Dispute update',
+          message: `The other party added their complaint on "${transaction.productTitle}".`,
+        });
+      }
+
+      return {
+        transactionId: transaction.id,
         status: TransactionStatus.DISPUTED,
-        auditLogs: {
-          create: {
-            action: 'dispute.created',
-            actorId,
-            detail: reason,
+        disputeId: primary.id,
+        childDisputeId: child.id,
+        event: 'dispute.party_complaint',
+      };
+    }
+
+    const dispute = await this.prisma.$transaction(async (db) => {
+      const created = await db.transactionDispute.create({
+        data: {
+          transactionId: transaction.id,
+          raisedByUserId: actorId,
+          raisedByRole,
+          description: cleanReason,
+        },
+      });
+      await db.transaction.update({
+        where: { id: transaction.id },
+        data: {
+          status: TransactionStatus.DISPUTED,
+          auditLogs: {
+            create: {
+              action: 'dispute.created',
+              actorId,
+              detail: cleanReason,
+            },
           },
         },
-      },
+      });
+      return created;
     });
+
     await this.rabbit.publish('dispute.created', {
-      transactionId: updated.id,
+      transactionId: transaction.id,
       actorId,
-      reason,
+      reason: cleanReason,
+      disputeId: dispute.id,
       occurredAt: new Date().toISOString(),
     });
     await this.notificationEvents.notifyDisputeOpened(
@@ -1681,12 +1951,219 @@ export class TransactionsService {
         productTitle: transaction.productTitle,
       },
       actorId,
-      reason,
+      cleanReason,
     );
     return {
-      transactionId: updated.id,
-      status: updated.status,
+      transactionId: transaction.id,
+      status: TransactionStatus.DISPUTED,
+      disputeId: dispute.id,
       event: 'dispute.created',
+    };
+  }
+
+  async respondToDispute(
+    transactionId: string,
+    disputeId: string,
+    actorId: string,
+    message: string,
+  ): Promise<Record<string, unknown>> {
+    const tx = await this.prisma.transaction.findUnique({ where: { id: transactionId } });
+    if (!tx) throw new NotFoundException('transaction not found');
+    const dispute = await this.prisma.transactionDispute.findUnique({
+      where: { id: disputeId },
+    });
+    if (!dispute || dispute.transactionId !== transactionId) {
+      throw new NotFoundException('dispute not found');
+    }
+    const allDisputes = await this.prisma.transactionDispute.findMany({
+      where: { transactionId },
+      include: { responses: true },
+    });
+    const primary = pickPrimaryDispute(allDisputes);
+    const targetDisputeId = primary?.id ?? disputeId;
+    if (actorId !== tx.buyerId && actorId !== tx.sellerId) {
+      throw new ConflictException('only buyer or seller can respond');
+    }
+    const clean = message.trim().slice(0, 500);
+    if (!clean) throw new BadRequestException('message is required');
+    const actorRole = actorId === tx.buyerId ? 'buyer' : 'seller';
+    const response = await this.prisma.transactionDisputeResponse.create({
+      data: {
+        disputeId: targetDisputeId,
+        actorId,
+        actorRole,
+        message: clean,
+      },
+    });
+    const recipientId = actorRole === 'buyer' ? tx.sellerId : tx.buyerId!;
+    await this.notificationEvents.notify({
+      transactionId,
+      recipientId,
+      role: actorRole === 'buyer' ? 'seller' : 'buyer',
+      eventType: 'transaction.dispute_response',
+      title: 'Dispute response',
+      message: `New response on dispute for "${tx.productTitle}".`,
+    });
+    return {
+      responseId: response.id,
+      createdAt: response.createdAt.toISOString(),
+    };
+  }
+
+  async approveDisputeRelease(
+    transactionId: string,
+    actorId: string,
+  ): Promise<Record<string, unknown>> {
+    const tx = await this.prisma.transaction.findUnique({ where: { id: transactionId } });
+    if (!tx || !tx.buyerId) throw new NotFoundException('transaction not found');
+    if (actorId !== tx.buyerId && actorId !== tx.sellerId) {
+      throw new ConflictException('only buyer or seller can approve release');
+    }
+    if (tx.status !== TransactionStatus.DISPUTED) {
+      throw new ConflictException('transaction is not disputed');
+    }
+    const releaseAmount = tx.sellerNetAmount?.toString() ?? tx.amount.toString();
+    await this.settleEscrowToSeller({
+      transactionId: tx.id,
+      sellerId: tx.sellerId,
+      amount: releaseAmount,
+      actorId,
+      productTitle: tx.productTitle,
+      releaseDespiteFreeze: true,
+    });
+    await this.prisma.transaction.update({
+      where: { id: tx.id },
+      data: {
+        status: TransactionStatus.COMPLETED,
+        auditLogs: {
+          create: {
+            action: 'dispute.approved_release',
+            actorId,
+            detail: `Party approved release of ${releaseAmount}`,
+          },
+        },
+      },
+    });
+    const recipientId = actorId === tx.buyerId ? tx.sellerId : tx.buyerId;
+    if (recipientId) {
+      await this.notificationEvents.notify({
+        transactionId: tx.id,
+        recipientId,
+        role: recipientId === tx.buyerId ? 'buyer' : 'seller',
+        eventType: 'transaction.dispute_release_approved',
+        title: 'Funds release approved',
+        message: `Your counterparty approved releasing funds for "${tx.productTitle}".`,
+      });
+    }
+    return { transactionId: tx.id, status: TransactionStatus.COMPLETED };
+  }
+
+  async saveDeliveryDetails(
+    transactionId: string,
+    actorId: string,
+    details: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const target = await this.resolvePurchaserTransactionForDelivery(
+      transactionId,
+      actorId,
+    );
+    let deliveryNeeded = false;
+    try {
+      const terms = JSON.parse(target.terms) as Record<string, unknown>;
+      deliveryNeeded = terms.deliveryNeeded === true;
+    } catch {
+      deliveryNeeded = false;
+    }
+    if (!deliveryNeeded) {
+      throw new ConflictException('delivery details are not required for this transaction');
+    }
+    const updated = await this.prisma.transaction.update({
+      where: { id: target.id },
+      data: {
+        deliveryDetails: details as object,
+        auditLogs: {
+          create: {
+            action: 'delivery.details_saved',
+            actorId,
+            detail: 'buyer submitted delivery details',
+          },
+        },
+      },
+    });
+    return {
+      transactionId: updated.id,
+      deliveryDetails: updated.deliveryDetails,
+    };
+  }
+
+  /**
+   * Resolves the transaction row delivery details should be stored on.
+   * Public share links may not have a buyer yet — reserve the buyer order the
+   * same way checkout does, without changing the payment-time claim flow.
+   */
+  private async resolvePurchaserTransactionForDelivery(
+    transactionId: string,
+    actorId: string,
+  ): Promise<{ id: string; terms: string }> {
+    const buyerId = actorId?.trim();
+    if (!buyerId) {
+      throw new BadRequestException('actorId required');
+    }
+
+    const tx = await this.prisma.transaction.findUnique({ where: { id: transactionId } });
+    if (!tx) {
+      throw new NotFoundException('transaction not found');
+    }
+    if (tx.sellerId === buyerId) {
+      throw new ConflictException('seller cannot submit delivery details');
+    }
+
+    if (tx.buyerId === buyerId) {
+      return { id: tx.id, terms: tx.terms };
+    }
+
+    if (tx.workflow === TransactionWorkflow.PUBLIC_SHAREABLE) {
+      if (tx.sourceShareTransactionId) {
+        if (tx.buyerId !== buyerId) {
+          throw new ConflictException(
+            'this transaction is assigned to another buyer',
+          );
+        }
+        return { id: tx.id, terms: tx.terms };
+      }
+
+      const claim = await this.claimPublicTransaction(
+        tx.shareToken ?? tx.id,
+        buyerId,
+      );
+      const orderId = String(claim.transactionId ?? '').trim();
+      if (!orderId) {
+        throw new ServiceUnavailableException('could not reserve checkout');
+      }
+      const order = await this.prisma.transaction.findUniqueOrThrow({
+        where: { id: orderId },
+      });
+      return { id: order.id, terms: order.terms };
+    }
+
+    if (tx.buyerId && tx.buyerId !== buyerId) {
+      throw new ConflictException('this transaction is assigned to another buyer');
+    }
+
+    throw new ConflictException(
+      'you must join this transaction before submitting delivery details',
+    );
+  }
+
+  async getDisputesForTransaction(transactionId: string) {
+    const rows = await this.prisma.transactionDispute.findMany({
+      where: { transactionId },
+      orderBy: { createdAt: 'asc' },
+      include: { responses: { orderBy: { createdAt: 'asc' } } },
+    });
+    const unified = mapUnifiedDispute(rows);
+    return {
+      disputes: unified ? [unified] : [],
     };
   }
 
@@ -1702,7 +2179,8 @@ export class TransactionsService {
     if (!tx) {
       throw new NotFoundException('transaction not found');
     }
-    const timeline = tx.auditLogs.map((entry) => ({
+    const txRow = await this.ensureTransactionFeesIfMissing(tx);
+    const timeline = txRow.auditLogs.map((entry) => ({
       at: entry.createdAt.toISOString(),
       action: entry.action,
       actorId: entry.actorId,
@@ -1719,50 +2197,67 @@ export class TransactionsService {
       sellerAgentParty,
       publicAnalytics,
       shareBuyerOrders,
+      paymentSnapshot,
+      disputeData,
     ] = await Promise.all([
-      tx.productId ? this.fetchProductSnapshotForRoom(tx.productId) : Promise.resolve(null),
-      tx.buyerId ? this.lookupPartyProfile(tx.buyerId) : Promise.resolve(null),
-      this.lookupPartyProfile(tx.sellerId),
-      tx.buyerLawyerId ? this.lookupPartyProfile(tx.buyerLawyerId) : Promise.resolve(null),
-      tx.buyerAgentId ? this.lookupPartyProfile(tx.buyerAgentId) : Promise.resolve(null),
-      tx.sellerLawyerId ? this.lookupPartyProfile(tx.sellerLawyerId) : Promise.resolve(null),
-      tx.sellerAgentId ? this.lookupPartyProfile(tx.sellerAgentId) : Promise.resolve(null),
-      tx.workflow === TransactionWorkflow.PUBLIC_SHAREABLE
-        ? this.getPublicAnalytics(tx)
+      tx.productId ? this.fetchProductSnapshotForRoom(txRow.productId) : Promise.resolve(null),
+      txRow.buyerId ? this.lookupPartyProfile(txRow.buyerId) : Promise.resolve(null),
+      this.lookupPartyProfile(txRow.sellerId),
+      txRow.buyerLawyerId ? this.lookupPartyProfile(txRow.buyerLawyerId) : Promise.resolve(null),
+      txRow.buyerAgentId ? this.lookupPartyProfile(txRow.buyerAgentId) : Promise.resolve(null),
+      txRow.sellerLawyerId ? this.lookupPartyProfile(txRow.sellerLawyerId) : Promise.resolve(null),
+      txRow.sellerAgentId ? this.lookupPartyProfile(txRow.sellerAgentId) : Promise.resolve(null),
+      txRow.workflow === TransactionWorkflow.PUBLIC_SHAREABLE
+        ? this.getPublicAnalytics(txRow)
         : Promise.resolve(null),
-      tx.shareToken
-        ? this.listShareBuyerOrders(tx.id)
+      txRow.shareToken
+        ? this.listShareBuyerOrders(txRow.id)
         : Promise.resolve(null),
+      this.fetchPaymentSnapshot(txRow.id),
+      this.getDisputesForTransaction(txRow.id),
     ]);
+
+    const feeFields = hydrateTransactionFeeFields(txRow);
 
     return {
       transaction: {
-        id: tx.id,
-        workflow: tx.workflow,
-        shareToken: tx.shareToken,
-        sharePath: tx.shareToken ? `/pay/${tx.shareToken}` : null,
-        type: tx.type,
-        productId: tx.productId,
-        productTitle: tx.productTitle,
-        quantity: tx.quantity,
-        unitPrice: tx.unitPrice?.toString() ?? null,
-        amount: tx.amount.toString(),
-        fundedBy: tx.fundedBy,
-        buyerId: tx.buyerId,
-        sellerId: tx.sellerId,
-        terms: tx.terms,
-        status: tx.status,
-        acceptedPartyIds: tx.acceptedPartyIds,
-        buyerLawyerId: tx.buyerLawyerId,
-        buyerLawyerInviteStatus: tx.buyerLawyerInviteStatus,
-        buyerAgentId: tx.buyerAgentId,
-        buyerAgentInviteStatus: tx.buyerAgentInviteStatus,
-        sellerLawyerId: tx.sellerLawyerId,
-        sellerLawyerInviteStatus: tx.sellerLawyerInviteStatus,
-        sellerAgentId: tx.sellerAgentId,
-        sellerAgentInviteStatus: tx.sellerAgentInviteStatus,
-        createdAt: tx.createdAt.toISOString(),
-        updatedAt: tx.updatedAt.toISOString(),
+        id: txRow.id,
+        workflow: txRow.workflow,
+        shareToken: txRow.shareToken,
+        sharePath: txRow.shareToken ? `/pay/${txRow.shareToken}` : null,
+        type: txRow.type,
+        productId: txRow.productId,
+        productTitle: txRow.productTitle,
+        quantity: txRow.quantity,
+        unitPrice: txRow.unitPrice?.toString() ?? null,
+        amount: feeFields.amount,
+        currencyCode: resolveTransactionCurrency({
+          currencyCode: txRow.currencyCode,
+          terms: txRow.terms,
+        }),
+        platformFeeAmount: feeFields.platformFeeAmount,
+        platformFeeType: feeFields.platformFeeType,
+        platformFeeTypeLabel: feeFields.platformFeeTypeLabel,
+        platformFeePercent: feeFields.platformFeePercent,
+        platformFeeFixed: feeFields.platformFeeFixed,
+        sellerNetAmount: feeFields.sellerNetAmount,
+        deliveryDetails: txRow.deliveryDetails,
+        fundedBy: txRow.fundedBy,
+        buyerId: txRow.buyerId,
+        sellerId: txRow.sellerId,
+        terms: txRow.terms,
+        status: txRow.status,
+        acceptedPartyIds: txRow.acceptedPartyIds,
+        buyerLawyerId: txRow.buyerLawyerId,
+        buyerLawyerInviteStatus: txRow.buyerLawyerInviteStatus,
+        buyerAgentId: txRow.buyerAgentId,
+        buyerAgentInviteStatus: txRow.buyerAgentInviteStatus,
+        sellerLawyerId: txRow.sellerLawyerId,
+        sellerLawyerInviteStatus: txRow.sellerLawyerInviteStatus,
+        sellerAgentId: txRow.sellerAgentId,
+        sellerAgentInviteStatus: txRow.sellerAgentInviteStatus,
+        createdAt: txRow.createdAt.toISOString(),
+        updatedAt: txRow.updatedAt.toISOString(),
       },
       product,
       parties: {
@@ -1775,11 +2270,24 @@ export class TransactionsService {
       },
       publicAnalytics,
       shareBuyerOrders,
-      documents: tx.documents,
-      agreements: tx.agreements,
-      auditLogs: tx.auditLogs,
+      documents: txRow.documents,
+      agreements: txRow.agreements,
+      auditLogs: txRow.auditLogs,
       timeline,
+      payment: paymentSnapshot,
+      disputes: disputeData.disputes,
     };
+  }
+
+  private async fetchPaymentSnapshot(transactionId: string) {
+    try {
+      return await this.rabbit.rpc<Record<string, unknown>>(
+        'escrow.rpc.transaction-payment.get',
+        { transactionId },
+      );
+    } catch {
+      return null;
+    }
   }
 
   private async lookupPartyProfile(userId: string | null | undefined): Promise<{
@@ -1826,34 +2334,72 @@ export class TransactionsService {
     if (!buyerId && !sellerId) {
       throw new BadRequestException('buyerId or sellerId query required');
     }
+    const where: Prisma.TransactionWhereInput = {
+      AND: [
+        {
+          OR: [
+            ...(buyerId ? [{ buyerId }] : []),
+            ...(sellerId ? [{ sellerId }] : []),
+            ...(buyerId
+              ? [
+                  { buyerLawyerId: buyerId },
+                  { buyerAgentId: buyerId },
+                  { sellerLawyerId: buyerId },
+                  { sellerAgentId: buyerId },
+                ]
+              : []),
+            ...(sellerId
+              ? [
+                  { buyerLawyerId: sellerId },
+                  { buyerAgentId: sellerId },
+                  { sellerLawyerId: sellerId },
+                  { sellerAgentId: sellerId },
+                ]
+              : []),
+          ],
+        },
+        {
+          OR: [
+            { sourceShareTransactionId: null },
+            { status: { not: TransactionStatus.AWAITING_FUNDING } },
+            ...(buyerId ? [{ buyerId }] : []),
+          ],
+        },
+        // Hide payment-link template once any buyer has paid (show buyer order only).
+        ...(sellerId
+          ? [
+              {
+                NOT: {
+                  AND: [
+                    { shareToken: { not: null } },
+                    { workflow: TransactionWorkflow.PUBLIC_SHAREABLE },
+                    {
+                      shareBuyerCopies: {
+                        some: {
+                          status: {
+                            notIn: [
+                              TransactionStatus.AWAITING_FUNDING,
+                              TransactionStatus.AWAITING_ACCEPTANCE,
+                            ],
+                          },
+                        },
+                      },
+                    },
+                  ],
+                },
+              },
+            ]
+          : []),
+      ],
+    };
     const rows = await this.prisma.transaction.findMany({
-      where: {
-        OR: [
-          ...(buyerId ? [{ buyerId }] : []),
-          ...(sellerId ? [{ sellerId }] : []),
-          ...(buyerId
-            ? [
-                { buyerLawyerId: buyerId },
-                { buyerAgentId: buyerId },
-                { sellerLawyerId: buyerId },
-                { sellerAgentId: buyerId },
-              ]
-            : []),
-          ...(sellerId
-            ? [
-                { buyerLawyerId: sellerId },
-                { buyerAgentId: sellerId },
-                { sellerLawyerId: sellerId },
-                { sellerAgentId: sellerId },
-              ]
-            : []),
-        ],
-      },
+      where,
       orderBy: { updatedAt: 'desc' },
       select: {
         id: true,
         workflow: true,
         shareToken: true,
+        sourceShareTransactionId: true,
         type: true,
         productId: true,
         productTitle: true,
@@ -1867,8 +2413,38 @@ export class TransactionsService {
         updatedAt: true,
       },
     });
+
+    const paidBuyerOrderStatuses = new Set<TransactionStatus>([
+      TransactionStatus.FUNDED,
+      TransactionStatus.IN_PROGRESS,
+      TransactionStatus.INSPECTION,
+      TransactionStatus.COMPLETED,
+      TransactionStatus.DISPUTED,
+      TransactionStatus.REFUNDED,
+      TransactionStatus.CLOSED,
+    ]);
+    const templatesWithPaidBuyer = new Set(
+      rows
+        .filter(
+          (r) =>
+            r.sourceShareTransactionId &&
+            paidBuyerOrderStatuses.has(r.status),
+        )
+        .map((r) => r.sourceShareTransactionId as string),
+    );
+    const deduped = rows.filter((row) => {
+      if (
+        row.shareToken &&
+        row.workflow === TransactionWorkflow.PUBLIC_SHAREABLE &&
+        templatesWithPaidBuyer.has(row.id)
+      ) {
+        return false;
+      }
+      return true;
+    });
+
     return {
-      items: rows.map((row) => ({
+      items: deduped.map((row) => ({
         ...row,
         sharePath: row.shareToken ? `/pay/${row.shareToken}` : null,
         unitPrice: row.unitPrice?.toString() ?? null,
