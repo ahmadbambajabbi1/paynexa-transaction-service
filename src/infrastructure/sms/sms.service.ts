@@ -23,7 +23,7 @@ export class SmsService {
       to: toPhone,
       from,
       body:
-        `SafeTrade invitation: You were invited as ${payload.role} ` +
+        `PayNexa invitation: You were invited as ${payload.role} ` +
         `for "${payload.productTitle}". Transaction ID: ${payload.transactionId}.`,
     });
   }

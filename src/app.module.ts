@@ -7,6 +7,9 @@ import { SmsModule } from './infrastructure/sms/sms.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { TransactionsController } from './transactions/transactions.controller';
 import { TransactionsService } from './transactions/transactions.service';
+import { FeesModule } from './fees/fees.module';
+import { AdminModule } from './admin/admin.module';
+import { InternalModule } from './internal/internal.module';
 
 import { RabbitmqRpcConsumer } from './infrastructure/rabbitmq/rabbitmq-rpc.consumer';
 
@@ -17,8 +20,15 @@ import { RabbitmqRpcConsumer } from './infrastructure/rabbitmq/rabbitmq-rpc.cons
     RabbitmqModule,
     SmsModule,
     NotificationsModule,
+    FeesModule,
+    AdminModule,
+    InternalModule,
   ],
   controllers: [TransactionsController],
-  providers: [TransactionsService, TransactionEventsListener, RabbitmqRpcConsumer],
+  providers: [
+    TransactionsService,
+    TransactionEventsListener,
+    RabbitmqRpcConsumer,
+  ],
 })
 export class AppModule {}
